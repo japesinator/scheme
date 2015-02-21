@@ -1,6 +1,7 @@
 module Main where
 
 import Control.Monad
+import Control.Monad.Error
 import System.Environment
 import Text.ParserCombinators.Parsec hiding (spaces)
 
@@ -133,20 +134,28 @@ primitives = [ ("+",              numericBinop (+))
       parsed = reads n :: [(Integer, String)]
     unpackNum (List [n]) = unpackNum n
     unpackNum _          = 0
+
   unaryOp f [v] = f v
+
   symbolp (Atom _)         = Bool True
   symbolp _                = Bool False
+
   numberp (Number _)       = Bool True
   numberp _                = Bool False
+
   stringp (String _)       = Bool True
   stringp _                = Bool False
+
   boolp   (Bool _)         = Bool True
   boolp   _                = Bool False
+
   listp   (List _)         = Bool True
   listp   (DottedList _ _) = Bool True
   listp   _                = Bool False
+
   symbol2string (Atom s)   = String s
   symbol2string _          = String ""
+
   string2symbol (String s) = Atom s
   string2symbol _          = Atom ""
 
@@ -154,6 +163,39 @@ readExpr :: String -> LispVal
 readExpr input = case parse parseExpr "lisp" input of
                       Left  err -> String $ "No match: " ++ show err
                       Right val -> val
+
+-- }}}
+-- Errors
+-- {{{
+
+data LispError = NumArgs        Integer [LispVal]
+               | TypeMismatch   String LispVal
+               | Parser         ParseError
+               | BadSpecialForm String LispVal
+               | NotFunction    String String
+               | UnboundVar     String String
+               | Default        String
+
+showError :: LispError -> String
+showError (UnboundVar message varname)  = message ++ ": " ++ varname
+showError (BadSpecialForm message form) = message ++ ": " ++ show form
+showError (NotFunction message func)    = message ++ ": " ++ show func
+showError (NumArgs expected found)      = "Expected " ++ show expected
+                                       ++ " args; found values " ++ (unwords . map show) found
+showError (TypeMismatch expected found) = "Invalid type: expected " ++ expected
+                                       ++ ", found " ++ show found
+showError (Parser parseErr)             = "Parse error at " ++ show parseErr
+
+instance Show LispError where show = showError
+
+instance Error LispError where
+  noMsg = Default "An error has occurred"
+  strMsg = Default
+
+type ThrowsError = Either LispError
+
+
+-- }}}
 
 main :: IO ()
 main = getArgs >>= print . eval . readExpr . head
