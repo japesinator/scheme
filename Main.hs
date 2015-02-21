@@ -14,67 +14,55 @@ spaces :: Parser ()
 spaces = skipMany1 space
 
 escapedChars :: Parser Char
-escapedChars = do
-                 char '\\'
-                 x <- oneOf "\\\"nrt"
-                 return $ case x of
-                               'n' -> '\n'
-                               'r' -> '\r'
-                               't' -> '\t'
-                               _   -> x
+escapedChars = do char '\\'
+                  x <- oneOf "\\\"nrt"
+                  return $ case x of
+                                'n' -> '\n'
+                                'r' -> '\r'
+                                't' -> '\t'
+                                _   -> x
 
 parseString :: Parser LispVal
-parseString = do
-                char '"'
-                x <- many $ escapedChars <|> noneOf "\""
-                char '"'
-                return $ String x
+parseString = do char '"'
+                 x <- many $ escapedChars <|> noneOf "\""
+                 char '"'
+                 return $ String x
 
 parseAtom :: Parser LispVal
-parseAtom = do
-              first <- letter <|> symbol
-              rest  <- many (letter <|> digit <|> symbol)
-              let atom = first : rest
-              return $ case atom of
-                            "#t" -> Bool True
-                            "#f" -> Bool False
-                            _    -> Atom atom
+parseAtom = do first <- letter <|> symbol
+               rest  <- many (letter <|> digit <|> symbol)
+               let atom = first : rest
+               return $ case atom of
+                 "#t" -> Bool True
+                 "#f" -> Bool False
+                 _    -> Atom atom
 
 parseNumber :: Parser LispVal
 parseNumber = liftM (Number . read) (many1 digit)
 
-unpackNum :: LispVal -> Integer
-unpackNum (Number n) = n
-unpackNum (String n) = if null parsed then 0 else fst $ head parsed
-        where parsed = reads n :: [(Integer, String)]
-
 parseCharacter :: Parser LispVal
-parseCharacter = do
-                   try $ string "#\\"
-                   value <- try (string "newline" <|> string "space")
-                        <|> do
-                              x <- anyChar
-                              notFollowedBy alphaNum
-                              return [x]
-                   return $ Character $ case value of
-                                             "space"   -> ' '
-                                             "newline" -> '\n'
-                                             _         -> head value
+parseCharacter = do try $ string "#\\"
+                    value <- try (string "newline" <|> string "space")
+                             <|> do x <- anyChar
+                                    notFollowedBy alphaNum
+                                    return [x]
+                    return $ Character $ case value of
+                                              "space"   -> ' '
+                                              "newline" -> '\n'
+                                              _         -> head value
 
 parseList :: Parser LispVal
 parseList = liftM List $ sepBy parseExpr spaces
 
 parseDottedList :: Parser LispVal
-parseDottedList = do
-                    first <- endBy parseExpr spaces
-                    rest  <- char '.' >> spaces >> parseExpr
-                    return $ DottedList first rest
+parseDottedList = do first <- endBy parseExpr spaces
+                     rest  <- char '.' >> spaces >> parseExpr
+                     return $ DottedList first rest
 
 quoteParser :: Char -> String -> Parser LispVal
-quoteParser c s = do
-                    char c
-                    x <- parseExpr
-                    return $ List [Atom s, x]
+quoteParser c s = do char c
+                     x <- parseExpr
+                     return $ List [Atom s, x]
 
 parseQuoted :: Parser LispVal
 parseQuoted = quoteParser '\'' "quote"
@@ -93,11 +81,10 @@ parseExpr = parseAtom
         <|> parseQuoted
 --        <|> parseQuasiQuoted
 --        <|> parseUnQuoted
-        <|> do
-              char '('
-              x <- try parseList <|> parseDottedList
-              char ')'
-              return x
+        <|> do char '('
+               x <- try parseList <|> parseDottedList
+               char ')'
+               return x
 
 -- }}}
 -- Types
@@ -121,6 +108,47 @@ eval val@(String _)             = val
 eval val@(Number _)             = val
 eval val@(Bool _)               = val
 eval (List [Atom "quote", val]) = val
+eval (List (Atom func : args)) = apply func $ map eval args where
+  apply f a = maybe (Bool False) ($ a) $ lookup f primitives
+
+primitives :: [(String, [LispVal] -> LispVal)]
+primitives = [ ("+",              numericBinop (+))
+             , ("-",              numericBinop (-))
+             , ("*",              numericBinop (*))
+             , ("/",              numericBinop div)
+             , ("mod",            numericBinop mod)
+             , ("quotient",       numericBinop quot)
+             , ("remainder",      numericBinop rem)
+             , ("symbol?",        unaryOp      symbolp)
+             , ("string?",        unaryOp      stringp)
+             , ("number?",        unaryOp      numberp)
+             , ("bool?",          unaryOp      boolp)
+             , ("list?",          unaryOp      listp)
+             , ("symbol2string?", unaryOp      symbol2string)
+             , ("string2symbol?", unaryOp      string2symbol)
+             ] where
+  numericBinop op params = Number $ foldl1 op $ map unpackNum params where
+    unpackNum (Number n) = n
+    unpackNum (String n) = if null parsed then 0 else fst $ head parsed where
+      parsed = reads n :: [(Integer, String)]
+    unpackNum (List [n]) = unpackNum n
+    unpackNum _          = 0
+  unaryOp f [v] = f v
+  symbolp (Atom _)         = Bool True
+  symbolp _                = Bool False
+  numberp (Number _)       = Bool True
+  numberp _                = Bool False
+  stringp (String _)       = Bool True
+  stringp _                = Bool False
+  boolp   (Bool _)         = Bool True
+  boolp   _                = Bool False
+  listp   (List _)         = Bool True
+  listp   (DottedList _ _) = Bool True
+  listp   _                = Bool False
+  symbol2string (Atom s)   = String s
+  symbol2string _          = String ""
+  string2symbol (String s) = Atom s
+  string2symbol _          = Atom ""
 
 readExpr :: String -> LispVal
 readExpr input = case parse parseExpr "lisp" input of
