@@ -1,3 +1,6 @@
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Main where
 
 import Control.Monad
@@ -104,15 +107,20 @@ data LispVal = Atom       String
 -- Evaluation
 -- {{{
 
-eval :: LispVal -> LispVal
-eval val@(String _)             = val
-eval val@(Number _)             = val
-eval val@(Bool _)               = val
-eval (List [Atom "quote", val]) = val
-eval (List (Atom func : args)) = apply func $ map eval args where
-  apply f a = maybe (Bool False) ($ a) $ lookup f primitives
+eval :: LispVal -> ThrowsError LispVal
+eval val@(String _) = return val
+eval val@(Number _) = return val
+eval val@(Bool _) = return val
+eval (List [Atom "quote", val]) = return val
+eval (List (Atom func : args)) = mapM eval args >>= apply func
+eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-primitives :: [(String, [LispVal] -> LispVal)]
+apply :: String -> [LispVal] -> ThrowsError LispVal
+apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
+                        ($ args)
+                        (lookup func primitives)
+
+primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [ ("+",              numericBinop (+))
              , ("-",              numericBinop (-))
              , ("*",              numericBinop (*))
@@ -127,42 +135,43 @@ primitives = [ ("+",              numericBinop (+))
              , ("list?",          unaryOp      listp)
              , ("symbol2string?", unaryOp      symbol2string)
              , ("string2symbol?", unaryOp      string2symbol)
-             ] where
-  numericBinop op params = Number $ foldl1 op $ map unpackNum params where
-    unpackNum (Number n) = n
-    unpackNum (String n) = if null parsed then 0 else fst $ head parsed where
-      parsed = reads n :: [(Integer, String)]
-    unpackNum (List [n]) = unpackNum n
-    unpackNum _          = 0
+             ]
 
-  unaryOp f [v] = f v
+numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
+numericBinop _            []  = throwError $ NumArgs 2 []
+numericBinop _  singleVal@[_] = throwError $ NumArgs 2 singleVal
+numericBinop op params        = liftM (Number . foldl1 op) (mapM unpackNum params)
 
-  symbolp (Atom _)         = Bool True
-  symbolp _                = Bool False
+unpackNum :: LispVal -> ThrowsError Integer
+unpackNum (Number n) = return n
+unpackNum (String n) = let parsed = reads n in
+                           if null parsed
+                           then throwError $ TypeMismatch "number" $ String n
+                           else return $ fst $ head parsed
+unpackNum (List [n]) = unpackNum n
+unpackNum notNum     = throwError $ TypeMismatch "number" notNum
 
-  numberp (Number _)       = Bool True
-  numberp _                = Bool False
+unaryOp :: (LispVal -> LispVal) -> [LispVal] -> ThrowsError LispVal
+unaryOp f [v] = return $ f v
 
-  stringp (String _)       = Bool True
-  stringp _                = Bool False
+symbolp, numberp, stringp, boolp, listp :: LispVal -> LispVal
+symbolp (Atom _)         = Bool True
+symbolp _                = Bool False
+numberp (Number _)       = Bool True
+numberp _                = Bool False
+stringp (String _)       = Bool True
+stringp _                = Bool False
+boolp   (Bool _)         = Bool True
+boolp   _                = Bool False
+listp   (List _)         = Bool True
+listp   (DottedList _ _) = Bool True
+listp   _                = Bool False
 
-  boolp   (Bool _)         = Bool True
-  boolp   _                = Bool False
-
-  listp   (List _)         = Bool True
-  listp   (DottedList _ _) = Bool True
-  listp   _                = Bool False
-
-  symbol2string (Atom s)   = String s
-  symbol2string _          = String ""
-
-  string2symbol (String s) = Atom s
-  string2symbol _          = Atom ""
-
-readExpr :: String -> LispVal
-readExpr input = case parse parseExpr "lisp" input of
-                      Left  err -> String $ "No match: " ++ show err
-                      Right val -> val
+symbol2string, string2symbol :: LispVal -> LispVal
+symbol2string (Atom s)   = String s
+symbol2string _          = String ""
+string2symbol (String s) = Atom s
+string2symbol _          = Atom ""
 
 -- }}}
 -- Errors
@@ -194,8 +203,20 @@ instance Error LispError where
 
 type ThrowsError = Either LispError
 
+trapError :: forall e (m :: * -> *). (Show e, MonadError e m) => m String -> m String
+trapError action = catchError action (return . show)
+
+extractValue :: ThrowsError a -> a
+extractValue (Right val) = val
+
+readExpr :: String -> ThrowsError LispVal
+readExpr input = case parse parseExpr "lisp" input of
+                      Left err  -> throwError $ Parser err
+                      Right val -> return val
 
 -- }}}
 
 main :: IO ()
-main = getArgs >>= print . eval . readExpr . head
+main = do args <- getArgs
+          let evaled = liftM show $ readExpr (head args) >>= eval
+          putStrLn $ extractValue $ trapError evaled
