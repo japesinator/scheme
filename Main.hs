@@ -19,7 +19,7 @@ spaces :: Parser ()
 spaces = skipMany1 space
 
 escapedChars :: Parser Char
-escapedChars = do char '\\'
+escapedChars = do _ <- char '\\'
                   x <- oneOf "\\\"nrt"
                   return $ case x of
                                 'n' -> '\n'
@@ -28,9 +28,9 @@ escapedChars = do char '\\'
                                 _   -> x
 
 parseString :: Parser LispVal
-parseString = do char '"'
+parseString = do _ <- char '"'
                  x <- many $ escapedChars <|> noneOf "\""
-                 char '"'
+                 _ <- char '"'
                  return $ String x
 
 parseAtom :: Parser LispVal
@@ -46,8 +46,8 @@ parseNumber :: Parser LispVal
 parseNumber = liftM (Number . read) (many1 digit)
 
 parseCharacter :: Parser LispVal
-parseCharacter = do try $ string "#\\"
-                    value <- try (string "newline" <|> string "space")
+parseCharacter = do _     <- try $ string "#\\"
+                    value <- try $ string "newline" <|> string "space"
                              <|> do x <- anyChar
                                     notFollowedBy alphaNum
                                     return [x]
@@ -65,7 +65,7 @@ parseDottedList = do first <- endBy parseExpr spaces
                      return $ DottedList first rest
 
 quoteParser :: Char -> String -> Parser LispVal
-quoteParser c s = do char c
+quoteParser c s = do _ <- char c
                      x <- parseExpr
                      return $ List [Atom s, x]
 
@@ -86,9 +86,9 @@ parseExpr = parseAtom
         <|> parseQuoted
 --        <|> parseQuasiQuoted
 --        <|> parseUnQuoted
-        <|> do char '('
+        <|> do _ <- char '('
                x <- try parseList <|> parseDottedList
-               char ')'
+               _ <- char ')'
                return x
 
 -- }}}
@@ -116,8 +116,20 @@ eval (List [Atom "quote", val])          = return val
 eval (List (Atom func : args))           = mapM eval args >>= apply func
 eval (List [Atom "if", pr, conseq, alt]) = do result <- eval pr
                                               case result of
+                                                Bool True  -> eval conseq
                                                 Bool False -> eval alt
-                                                _          -> eval conseq
+                                                _          -> throwError $ TypeMismatch "bool" pr
+eval form@(List (Atom "cond" : clauses)) =
+  if null clauses
+  then throwError $ BadSpecialForm "no true clause in cond expression: " form
+  else case head clauses of
+            List [Atom "else", expr] -> eval expr
+            List [test, expr]        -> eval $ List [ Atom "if"
+                                                    , test
+                                                    , expr
+                                                    , List (Atom "cond" : tail clauses)
+                                                    ]
+            _                        -> throwError $ BadSpecialForm "ill-formed cond expression: " form
 eval badForm                             = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
@@ -162,9 +174,9 @@ primitives = [ ("&&",             boolBoolBinop (&&))
              ]
 
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
-numericBinop _            []  = throwError $ NumArgs 2 []
-numericBinop _  singleVal@[_] = throwError $ NumArgs 2 singleVal
-numericBinop op params        = liftM (Number . foldl1 op) (mapM unpackNum params)
+numericBinop _ []      = throwError $ NumArgs 2 []
+numericBinop _ [x]     = throwError $ NumArgs 2 [x]
+numericBinop op params = liftM (Number . foldl1 op) (mapM unpackNum params)
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsError LispVal
 boolBinop unpacker op args = if length args /= 2
@@ -249,11 +261,7 @@ eqv [Number arg1, Number arg2]         = return $ Bool $ arg1 == arg2
 eqv [String arg1, String arg2]         = return $ Bool $ arg1 == arg2
 eqv [Atom arg1, Atom arg2]             = return $ Bool $ arg1 == arg2
 eqv [DottedList xs x, DottedList ys y] = eqv [List $ xs ++ [x], List $ ys ++ [y]]
-eqv [List arg1, List arg2]             = return $ Bool $ (length arg1 == length arg2) &&
-                                                         all eqvPair (zip arg1 arg2)
-    where eqvPair (x1, x2) = case eqv [x1, x2] of
-                                  Left _           -> False
-                                  Right (Bool val) -> val
+eqv [List arg1, List arg2]             = eqvList eqv [List arg1, List arg2]
 eqv [_, _]                             = return $ Bool False
 eqv badArgList                         = throwError $ NumArgs 2 badArgList
 
@@ -265,12 +273,24 @@ unpackEquals arg1 arg2 (AnyUnpacker unpacker) = do unpacked1 <- unpacker arg1
                                                    return $ unpacked1 == unpacked2
                                                  `catchError` const (return False)
 
+eqvList :: ([LispVal] -> ThrowsError LispVal) -> [LispVal] -> ThrowsError LispVal
+eqvList eqvFunc [List arg1, List arg2] = return $ Bool $ (length arg1 == length arg2) &&
+                                                         all eqvPair (zip arg1 arg2)
+    where eqvPair (x1, x2) = case eqvFunc [x1, x2] of
+                                  Left _           -> False
+                                  Right (Bool val) -> val
+
 equal :: [LispVal] -> ThrowsError LispVal
-equal [arg1, arg2] = do primitiveEquals <- liftM or $ mapM (unpackEquals arg1 arg2)
-                                          [AnyUnpacker unpackNum, AnyUnpacker unpackStr, AnyUnpacker unpackBool]
-                        eqvEquals <- eqv [arg1, arg2]
-                        return $ Bool $ primitiveEquals || let (Bool x) = eqvEquals in x
-equal badArgList   = throwError $ NumArgs 2 badArgList
+equal [List arg1, List arg2]             = eqvList equal [List arg1, List arg2]
+equal [DottedList xs x, DottedList ys y] = equal [List $ xs ++ [x], List $ ys ++ [y]]
+equal [arg1, arg2]                       = do primitiveEquals <- liftM or $ mapM (unpackEquals arg1 arg2)
+                                                                                 [ AnyUnpacker unpackNum
+                                                                                 , AnyUnpacker unpackStr
+                                                                                 , AnyUnpacker unpackBool
+                                                                                 ]
+                                              eqvEquals <- eqv [arg1, arg2]
+                                              return $ Bool $ primitiveEquals || let (Bool x) = eqvEquals in x
+equal badArgList                         = throwError $ NumArgs 2 badArgList
 
 -- }}}
 -- Errors
