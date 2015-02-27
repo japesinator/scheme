@@ -7,6 +7,7 @@ module Main where
 import Control.Monad
 import Control.Monad.Error
 import System.Environment
+import System.IO
 import Text.ParserCombinators.Parsec hiding (spaces)
 
 -- Parsing
@@ -113,7 +114,6 @@ eval val@(String _)                      = return val
 eval val@(Number _)                      = return val
 eval val@(Bool _)                        = return val
 eval (List [Atom "quote", val])          = return val
-eval (List (Atom func : args))           = mapM eval args >>= apply func
 eval (List [Atom "if", pr, conseq, alt]) = do result <- eval pr
                                               case result of
                                                 Bool True  -> eval conseq
@@ -130,6 +130,7 @@ eval form@(List (Atom "cond" : clauses)) =
                                                     , List (Atom "cond" : tail clauses)
                                                     ]
             _                        -> throwError $ BadSpecialForm "ill-formed cond expression: " form
+eval (List (Atom func : args))           = mapM eval args >>= apply func
 eval badForm                             = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
@@ -334,8 +335,35 @@ readExpr input = case parse parseExpr "lisp" input of
                       Right val -> return val
 
 -- }}}
+-- REPL
+-- {{{
+
+flushStr :: String -> IO ()
+flushStr str = putStr str >> hFlush stdout
+
+readPrompt :: String -> IO String
+readPrompt prompt = flushStr prompt >> getLine
+
+evalString :: String -> IO String
+evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+
+evalAndPrint :: String -> IO ()
+evalAndPrint expr =  evalString expr >>= putStrLn
+
+
+
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ pr prompt action = do result <- prompt
+                             unless (pr result) $ action result >> until_ pr prompt action
+
+runRepl :: IO ()
+runRepl = until_ (\x -> (x == ":quit") || (x == "q")) (readPrompt "Lisp>>> ") evalAndPrint
+
+-- }}}
 
 main :: IO ()
 main = do args <- getArgs
-          let evaled = liftM show $ readExpr (head args) >>= eval
-          putStrLn $ extractValue $ trapError evaled
+          case length args of
+            0 -> runRepl
+            1 -> evalAndPrint $ head args
+            _ -> putStrLn "Program takes only 0 or 1 argument"
