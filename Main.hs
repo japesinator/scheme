@@ -44,7 +44,7 @@ parseAtom = do first <- letter <|> symbol
                  _    -> Atom atom
 
 parseNumber :: Parser LispVal
-parseNumber = liftM (Number . read) (many1 digit)
+parseNumber = liftM (Number . read) $ many1 digit
 
 parseCharacter :: Parser LispVal
 parseCharacter = do _     <- try $ string "#\\"
@@ -135,8 +135,7 @@ eval badForm                             = throwError $ BadSpecialForm "Unrecogn
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
 apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
-                        ($ args)
-                        (lookup func primitives)
+                        ($ args) $ lookup func primitives
 
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [ ("&&",             boolBoolBinop (&&))
@@ -177,7 +176,7 @@ primitives = [ ("&&",             boolBoolBinop (&&))
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
 numericBinop _ []      = throwError $ NumArgs 2 []
 numericBinop _ [x]     = throwError $ NumArgs 2 [x]
-numericBinop op params = liftM (Number . foldl1 op) (mapM unpackNum params)
+numericBinop op params = liftM (Number . foldl1 op) $ mapM unpackNum params
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsError LispVal
 boolBinop unpacker op args = if length args /= 2
@@ -318,13 +317,13 @@ showError (Parser parseErr)             = "Parse error at " ++ show parseErr
 instance Show LispError where show = showError
 
 instance Error LispError where
-  noMsg = Default "An error has occurred"
+  noMsg  = Default "An error has occurred"
   strMsg = Default
 
 type ThrowsError = Either LispError
 
 trapError :: forall e (m :: * -> *). (Show e, MonadError e m) => m String -> m String
-trapError action = catchError action (return . show)
+trapError action = catchError action $ return . show
 
 extractValue :: ThrowsError a -> a
 extractValue (Right val) = val
@@ -345,12 +344,10 @@ readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
 evalString :: String -> IO String
-evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+evalString expr = return $ extractValue $ trapError $ liftM show $ readExpr expr >>= eval
 
 evalAndPrint :: String -> IO ()
 evalAndPrint expr =  evalString expr >>= putStrLn
-
-
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
 until_ pr prompt action = do result <- prompt
