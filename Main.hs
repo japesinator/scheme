@@ -1,5 +1,4 @@
 {-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE RankNTypes #-}
 
 module Main where
@@ -215,6 +214,7 @@ unpackBool notBool  = throwError $ TypeMismatch "boolean" notBool
 
 unaryOp :: (LispVal -> LispVal) -> [LispVal] -> ThrowsError LispVal
 unaryOp f [v] = return $ f v
+unaryOp _ _   = error "Wrong number of arguments given to a unary operation"
 
 symbolp, numberp, stringp, boolp, listp :: LispVal -> LispVal
 symbolp (Atom _)         = Bool True
@@ -279,6 +279,8 @@ eqvList eqvFunc [List arg1, List arg2] = return $ Bool $ (length arg1 == length 
     where eqvPair (x1, x2) = case eqvFunc [x1, x2] of
                                   Left _           -> False
                                   Right (Bool val) -> val
+                                  _                -> error "eqvList failed"
+eqvList _       _                      = error "Bad arguments given to eqvList"
 
 equal :: [LispVal] -> ThrowsError LispVal
 equal [List arg1, List arg2]             = eqvList equal [List arg1, List arg2]
@@ -313,6 +315,7 @@ showError (NumArgs expected found)      = "Expected " ++ show expected
 showError (TypeMismatch expected found) = "Invalid type: expected " ++ expected
                                        ++ ", found " ++ show found
 showError (Parser parseErr)             = "Parse error at " ++ show parseErr
+showError _                             = "Unknown error"
 
 instance Show LispError where show = showError
 
@@ -321,12 +324,6 @@ instance Error LispError where
   strMsg = Default
 
 type ThrowsError = Either LispError
-
-trapError :: forall e (m :: * -> *). (Show e, MonadError e m) => m String -> m String
-trapError action = catchError action $ return . show
-
-extractValue :: ThrowsError a -> a
-extractValue (Right val) = val
 
 readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
@@ -344,7 +341,10 @@ readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
 evalString :: String -> IO String
-evalString expr = return $ extractValue $ trapError $ liftM show $ readExpr expr >>= eval
+evalString expr = return . extractValue . trapError . liftM show $ readExpr expr >>= eval
+  where trapError action = catchError action $ return . show
+        extractValue (Right val) = val
+        extractValue _           = error "Trapping errors failed"
 
 evalAndPrint :: String -> IO ()
 evalAndPrint expr =  evalString expr >>= putStrLn
