@@ -1,11 +1,12 @@
 {-# OPTIONS_GHC -fno-warn-warnings-deprecations #-}
 {-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE RankNTypes #-}
 
 module Main where
 
 import Control.Monad
 import Control.Monad.Error
+import Data.IORef
+import Data.Maybe
 import System.Environment
 import System.IO
 import Text.ParserCombinators.Parsec hiding (spaces)
@@ -326,11 +327,38 @@ instance Error LispError where
 
 type ThrowsError = Either LispError
 
+trapError :: (MonadError e m, Show e) => m String -> m String
+trapError action = catchError action (return . show)
+
 readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
                       Left err  -> throwError $ Parser err
                       Right val -> return val
 
+-- }}}
+-- Environment
+-- {{{
+
+type Env = IORef [(String, IORef LispVal)]
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+type IOThrowsError = ErrorT LispError IO
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err)  = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows = liftM extractValue . runErrorT . trapError
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var = liftM (isJust . lookup var) (readIORef envRef)
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef var = maybe (throwError $ UnboundVar "Getting an unbound variable" var)
+                    (liftIO . readIORef) . lookup var =<< liftIO (readIORef envRef)
 -- }}}
 -- REPL
 -- {{{
@@ -341,11 +369,12 @@ flushStr str = putStr str >> hFlush stdout
 readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
+extractValue :: Either a b -> b
+extractValue (Right val) = val
+extractValue _           = error "Trapping errors failed"
+
 evalString :: String -> IO String
 evalString expr = return . extractValue . trapError . liftM show $ readExpr expr >>= eval
-  where trapError action = catchError action $ return . show
-        extractValue (Right val) = val
-        extractValue _           = error "Trapping errors failed"
 
 evalAndPrint :: String -> IO ()
 evalAndPrint expr =  evalString expr >>= putStrLn
