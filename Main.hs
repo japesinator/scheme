@@ -3,6 +3,7 @@
 
 module Main where
 
+import Control.Applicative ((<$>))
 import Control.Monad
 import Control.Monad.Error
 import Data.IORef
@@ -45,7 +46,7 @@ parseAtom = do first <- letter <|> symbol
                  _    -> Atom atom
 
 parseNumber :: Parser LispVal
-parseNumber = liftM (Number . read) $ many1 digit
+parseNumber = (Number . read) <$> many1 digit
 
 parseCharacter :: Parser LispVal
 parseCharacter = do _     <- try $ string "#\\"
@@ -59,7 +60,7 @@ parseCharacter = do _     <- try $ string "#\\"
                                               _         -> head value
 
 parseList :: Parser LispVal
-parseList = liftM List $ sepBy parseExpr spaces
+parseList = List <$> sepBy parseExpr spaces
 
 parseDottedList :: Parser LispVal
 parseDottedList = do first <- endBy parseExpr spaces
@@ -67,9 +68,7 @@ parseDottedList = do first <- endBy parseExpr spaces
                      return $ DottedList first rest
 
 quoteParser :: Char -> String -> Parser LispVal
-quoteParser c s = do _ <- char c
-                     x <- parseExpr
-                     return $ List [Atom s, x]
+quoteParser = flip (fmap . (List .) . (. return) . (:) . Atom) . (>> parseExpr) . char
 
 parseQuoted :: Parser LispVal
 parseQuoted = quoteParser '\'' "quote"
@@ -177,7 +176,7 @@ primitives = [ ("&&",             boolBoolBinop (&&))
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
 numericBinop _ []      = throwError $ NumArgs 2 []
 numericBinop _ [x]     = throwError $ NumArgs 2 [x]
-numericBinop op params = liftM (Number . foldl1 op) $ mapM unpackNum params
+numericBinop op params = (Number . foldl1 op) <$> mapM unpackNum params
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsError LispVal
 boolBinop unpacker op args = if length args /= 2
@@ -187,10 +186,10 @@ boolBinop unpacker op args = if length args /= 2
                                      return $ Bool $ left `op` right
 
 numBoolBinop :: (Integer -> Integer -> Bool) -> [LispVal] -> ThrowsError LispVal
-numBoolBinop  = boolBinop unpackNum
+numBoolBinop = boolBinop unpackNum
 
 strBoolBinop :: (String -> String -> Bool) -> [LispVal] -> ThrowsError LispVal
-strBoolBinop  = boolBinop unpackStr
+strBoolBinop = boolBinop unpackStr
 
 boolBoolBinop :: (Bool -> Bool -> Bool) -> [LispVal] -> ThrowsError LispVal
 boolBoolBinop = boolBinop unpackBool
@@ -287,11 +286,11 @@ eqvList _       _                      = error "Bad arguments given to eqvList"
 equal :: [LispVal] -> ThrowsError LispVal
 equal [List arg1, List arg2]             = eqvList equal [List arg1, List arg2]
 equal [DottedList xs x, DottedList ys y] = equal [List $ xs ++ [x], List $ ys ++ [y]]
-equal [arg1, arg2]                       = do primitiveEquals <- liftM or $ mapM (unpackEquals arg1 arg2)
-                                                                                 [ AnyUnpacker unpackNum
-                                                                                 , AnyUnpacker unpackStr
-                                                                                 , AnyUnpacker unpackBool
-                                                                                 ]
+equal [arg1, arg2]                       = do primitiveEquals <- or <$> mapM (unpackEquals arg1 arg2)
+                                                                             [ AnyUnpacker unpackNum
+                                                                             , AnyUnpacker unpackStr
+                                                                             , AnyUnpacker unpackBool
+                                                                             ]
                                               eqvEquals <- eqv [arg1, arg2]
                                               return $ Bool $ primitiveEquals || let (Bool x) = eqvEquals in x
 equal badArgList                         = throwError $ NumArgs 2 badArgList
@@ -354,7 +353,7 @@ runIOThrows :: IOThrowsError String -> IO String
 runIOThrows = liftM extractValue . runErrorT . trapError
 
 isBound :: Env -> String -> IO Bool
-isBound envRef var = liftM (isJust . lookup var) (readIORef envRef)
+isBound = flip (fmap . (isJust .) . lookup) . readIORef
 
 getVar :: Env -> String -> IOThrowsError LispVal
 getVar envRef var = maybe (throwError $ UnboundVar "Getting an unbound variable" var)
@@ -364,27 +363,26 @@ getVar envRef var = maybe (throwError $ UnboundVar "Getting an unbound variable"
 -- {{{
 
 flushStr :: String -> IO ()
-flushStr str = putStr str >> hFlush stdout
+flushStr = (>> hFlush stdout) . putStr
 
 readPrompt :: String -> IO String
-readPrompt prompt = flushStr prompt >> getLine
+readPrompt = (>> getLine) . flushStr
 
 extractValue :: Either a b -> b
 extractValue (Right val) = val
 extractValue _           = error "Trapping errors failed"
 
 evalString :: String -> IO String
-evalString expr = return . extractValue . trapError . liftM show $ readExpr expr >>= eval
+evalString = return . extractValue . trapError . fmap show . (eval =<<) . readExpr
 
 evalAndPrint :: String -> IO ()
-evalAndPrint expr =  evalString expr >>= putStrLn
+evalAndPrint = (>>= putStrLn) . evalString
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
-until_ pr prompt action = do result <- prompt
-                             unless (pr result) $ action result >> until_ pr prompt action
+until_ pr prompt action = liftM2 unless pr ((>> until_ pr prompt action) . action) =<< prompt
 
 runRepl :: IO ()
-runRepl = until_ (\x -> (x == ":quit") || (x == "q")) (readPrompt "Lisp>>> ") evalAndPrint
+runRepl = until_ (liftM2 (||) (":quit" ==) ("q" ==)) (readPrompt "Lisp>>> ") evalAndPrint
 
 -- }}}
 
