@@ -2,6 +2,7 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE TupleSections #-}
 
 module Main where
 
@@ -23,7 +24,7 @@ spaces :: Parser ()
 spaces = skipMany1 space
 
 escapedChars :: Parser Char
-escapedChars = char '\\' >> oneOf "\\\"nrt" >>=
+escapedChars = char '\\' *> oneOf "\\\"nrt" >>=
                  \x -> pure $ case x of 'n' -> '\n'
                                         'r' -> '\r'
                                         't' -> '\t'
@@ -50,7 +51,7 @@ parseCharacter = do
   _ <- try (string "#\\")
   value <- try $ string "newline"
              <|> string "space"
-             <|> (anyChar >>= (notFollowedBy alphaNum >>) . pure . return)
+             <|> (anyChar >>= (notFollowedBy alphaNum *>) . pure . return)
   pure . Character $ case value of
                           "space"   -> ' '
                           "newline" -> '\n'
@@ -61,12 +62,12 @@ parseList = List <$> sepBy parseExpr spaces
 
 parseDottedList :: Parser LispVal
 parseDottedList = do first <- endBy parseExpr spaces
-                     rest  <- char '.' >> spaces >> parseExpr
+                     rest  <- char '.' *> spaces *> parseExpr
                      pure $ DottedList first rest
 
 quoteParser :: Char -> String -> Parser LispVal
 quoteParser = flip (fmap . (List .) . (. pure) . (:) . Atom)
-                . (>> parseExpr) . char
+                . (*> parseExpr) . char
 
 parseQuoted :: Parser LispVal
 parseQuoted = quoteParser '\'' "quote"
@@ -107,28 +108,35 @@ data LispVal = Atom       String
 -- Evaluation
 -- {{{
 
-eval :: LispVal -> ThrowsError LispVal
-eval val@(String _)                      = pure val
-eval val@(Number _)                      = pure val
-eval val@(Bool _)                        = pure val
-eval (List [Atom "quote", val])          = pure val
-eval (List [Atom "if", pr, conseq, alt]) = eval pr >>= \case
-  Bool True  -> eval conseq
-  Bool False -> eval alt
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval _   val@(String _)                      = pure val
+eval _   val@(Number _)                      = pure val
+eval _   val@(Bool _)                        = pure val
+eval env (Atom i)                            = getVar env i
+eval _   (List [Atom "quote", val])          = pure val
+eval env (List [Atom "if", pr, conseq, alt]) = eval env pr >>= \case
+  Bool True  -> eval env conseq
+  Bool False -> eval env alt
   _          -> throwError $ TypeMismatch "bool" pr
-eval form@(List (Atom "cond" : clauses)) =
+eval env (List [Atom "set!", Atom var, form])   = eval env form >>=
+  setVar env var
+eval env (List [Atom "define", Atom var, form]) = eval env form >>=
+  defineVar env var
+eval env form@(List (Atom "cond" : clauses)) =
   if null clauses
   then throwError $ BadSpecialForm "no true clause in cond expression: " form
   else case head clauses of
-            List [Atom "else", expr] -> eval expr
-            List [test, expr] -> eval $ List [ Atom "if"
-                                             , test
-                                             , expr
-                                             , List (Atom "cond" : tail clauses)
-                                             ]
+            List [Atom "else", expr] -> eval env expr
+            List [test, expr] -> eval env $
+                                   List [ Atom "if"
+                                        , test
+                                        , expr
+                                        , List (Atom "cond" : tail clauses)
+                                        ]
             _ -> throwError $ BadSpecialForm "ill-formed cond expression: " form
-eval (List (Atom func : args)) = mapM eval args >>= apply func
-eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+eval env (List (Atom func : args)) = mapM (eval env) args >>=
+  liftThrows . apply func
+eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
 apply func args = maybe
@@ -357,23 +365,41 @@ getVar envRef var = maybe
   (throwError $ UnboundVar "Getting an unbound variable" var)
   (liftIO . readIORef) . lookup var =<< liftIO (readIORef envRef)
 
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef var value = liftIO (readIORef envRef) >>=
+    maybe (throwError $ UnboundVar "Setting an unbound variable" var)
+          (liftIO . (`writeIORef` value)) . lookup var >> pure value
+
+defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defineVar envRef var value = do
+  alreadyDefined <- liftIO $ isBound envRef var
+  if alreadyDefined then setVar envRef var value >> return value
+                    else liftIO $ liftA2 ((writeIORef envRef .) . (:) . (var,))
+                                         (newIORef value) (readIORef envRef)
+                               *> pure value
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef = (>>= newIORef) . (readIORef envRef >>=)
+                . flip (fmap . flip (++))
+                . mapM (uncurry $ flip ((>>=) . newIORef) . (pure .) . (,))
+
 -- }}}
 -- REPL
 -- {{{
 
-evalAndPrint :: String -> IO ()
-evalAndPrint = (>>= putStrLn) . pure . (\(Right a) -> a) . trapError . fmap show
-                 . (>>= eval) . readExpr
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env = (>>= putStrLn) . runIOThrows . fmap show . (>>= eval env)
+                 . liftThrows . readExpr
 
 runRepl :: IO ()
-runRepl = (hFlush stdout >> putStr "Lisp>>> " >> getLine)
-  >>= liftA2 unless (liftA2 (||) (":quit" ==) ("q" ==))
-                    ((>> runRepl) . evalAndPrint)
+runRepl = nullEnv >>= ((hFlush stdout *> putStr "Lisp>*> " *> getLine) >>=)
+        . liftA2 unless (liftA2 (||) (":quit" ==) ("q" ==))
+        . ((*> runRepl) .) . evalAndPrint
 
 -- }}}
 
 main :: IO ()
 main = length <$> getArgs >>= \case
   0 -> runRepl
-  1 -> getArgs >>= evalAndPrint . head
+  1 -> head <$> getArgs >>= (nullEnv >>=) . flip evalAndPrint
   _ -> putStrLn "Program takes only 0 or 1 argument"
