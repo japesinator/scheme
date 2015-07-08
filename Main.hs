@@ -37,11 +37,11 @@ parseString = do _ <- char '"'
                  pure $ String x
 
 parseAtom :: Parser LispVal
-parseAtom = liftA2 (:) (letter <|> symbol)
-                       (many (letter <|> digit <|> symbol)) >>=
-              \atom -> pure $ if | atom == "#t" -> Bool True
-                                 | atom == "#f" -> Bool False
-                                 | otherwise    -> Atom atom
+parseAtom = do atom <- liftA2 (:) (letter <|> symbol)
+                                  (many $ letter <|> digit <|> symbol)
+               pure $ if | atom == "#t" -> Bool True
+                         | atom == "#f" -> Bool False
+                         | otherwise    -> Atom atom
 
 parseNumber :: Parser LispVal
 parseNumber = Number . read <$> many1 digit
@@ -61,13 +61,12 @@ parseList :: Parser LispVal
 parseList = List <$> sepBy parseExpr spaces
 
 parseDottedList :: Parser LispVal
-parseDottedList = do first <- endBy parseExpr spaces
-                     rest  <- char '.' *> spaces *> parseExpr
-                     pure $ DottedList first rest
+parseDottedList = liftA2 DottedList (endBy parseExpr spaces)
+                                    (char '.' *> spaces *> parseExpr)
 
 quoteParser :: Char -> String -> Parser LispVal
 quoteParser = flip (fmap . (List .) . (. pure) . (:) . Atom)
-                . (*> parseExpr) . char
+            . (*> parseExpr) . char
 
 parseQuoted :: Parser LispVal
 parseQuoted = quoteParser '\'' "quote"
@@ -136,6 +135,7 @@ eval env form@(List (Atom "cond" : clauses)) =
             _ -> throwError $ BadSpecialForm "ill-formed cond expression: " form
 eval env (List (Atom func : args)) = mapM (eval env) args >>=
   liftThrows . apply func
+eval _ val@(List _)                = pure val
 eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
@@ -181,17 +181,16 @@ primitives = [ ("&&",             boolBoolBinop (&&))
 
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] ->
   ThrowsError LispVal
-numericBinop _ []      = throwError $ NumArgs 2 []
-numericBinop _ [x]     = throwError $ NumArgs 2 [x]
+numericBinop _  []     = throwError $ NumArgs 2 []
+numericBinop _  [x]    = throwError $ NumArgs 2 [x]
 numericBinop op params = Number . foldl1 op <$> mapM unpackNum params
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] ->
   ThrowsError LispVal
 boolBinop unpacker op args = if length args /= 2
                              then throwError $ NumArgs 2 args
-                             else do left  <- unpacker $ head args
-                                     right <- unpacker $ last args
-                                     pure $ Bool $ left `op` right
+                             else Bool <$> liftA2 op (unpacker $ head args)
+                                                     (unpacker $ last args)
 
 numBoolBinop :: (Integer -> Integer -> Bool) -> [LispVal] -> ThrowsError LispVal
 numBoolBinop = boolBinop unpackNum
@@ -351,11 +350,10 @@ nullEnv = newIORef []
 type IOThrowsError = ErrorT LispError IO
 
 liftThrows :: ThrowsError a -> IOThrowsError a
-liftThrows (Left err)  = throwError err
-liftThrows (Right val) = pure val
+liftThrows = either throwError pure
 
 runIOThrows :: IOThrowsError String -> IO String
-runIOThrows = liftA (\(Right a) -> a) . runErrorT . trapError
+runIOThrows = fmap (\(Right a) -> a) . runErrorT . trapError
 
 isBound :: Env -> String -> IO Bool
 isBound = flip (fmap . (isJust .) . lookup) . readIORef
@@ -374,9 +372,10 @@ defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
 defineVar envRef var value = do
   alreadyDefined <- liftIO $ isBound envRef var
   if alreadyDefined then setVar envRef var value >> return value
-                    else liftIO $ liftA2 ((writeIORef envRef .) . (:) . (var,))
-                                         (newIORef value) (readIORef envRef)
-                               *> pure value
+                    else liftIO $ do valueRef <- newIORef value
+                                     env <- readIORef envRef
+                                     writeIORef envRef ((var, valueRef) : env)
+                                     return value
 
 bindVars :: Env -> [(String, LispVal)] -> IO Env
 bindVars envRef = (>>= newIORef) . (readIORef envRef >>=)
@@ -391,15 +390,14 @@ evalAndPrint :: Env -> String -> IO ()
 evalAndPrint env = (>>= putStrLn) . runIOThrows . fmap show . (>>= eval env)
                  . liftThrows . readExpr
 
-runRepl :: IO ()
-runRepl = nullEnv >>= ((hFlush stdout *> putStr "Lisp>*> " *> getLine) >>=)
-        . liftA2 unless (liftA2 (||) (":quit" ==) ("q" ==))
-        . ((*> runRepl) .) . evalAndPrint
+runRepl :: Env -> IO ()
+runRepl = tilQuit (putStr "Lisp>>> " *> hFlush stdout *> getLine) . evalAndPrint
+  where tilQuit p a = liftA2 unless (== "quit") ((*> tilQuit p a) . a) =<< p
 
 -- }}}
 
 main :: IO ()
 main = length <$> getArgs >>= \case
-  0 -> runRepl
-  1 -> head <$> getArgs >>= (nullEnv >>=) . flip evalAndPrint
+  0 -> nullEnv >>= runRepl
+  1 -> getArgs >>= (nullEnv >>=) . flip evalAndPrint . head
   _ -> putStrLn "Program takes only 0 or 1 argument"
