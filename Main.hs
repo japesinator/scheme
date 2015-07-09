@@ -1,20 +1,20 @@
 {-# OPTIONS_GHC -fno-warn-warnings-deprecations #-}
 {-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE LambdaCase, MultiWayIf, TupleSections #-}
 
 module Main (main) where
 
-import Control.Applicative hiding ((<|>), many)
-import Control.Arrow
-import Control.Monad
-import Control.Monad.Error
-import Data.IORef
-import Data.Maybe
-import System.Environment
-import System.IO
-import Text.ParserCombinators.Parsec hiding (spaces)
+import Control.Applicative ((<$>), (*>), pure, liftA2)
+import Control.Arrow (second)
+import Control.Monad.Error (catchError, Error, ErrorT, forM, join, liftIO,
+  liftM2, noMsg, runErrorT, strMsg, throwError, unless)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust, isNothing)
+import System.Environment (getArgs)
+import System.IO (hFlush, stdout)
+import Text.ParserCombinators.Parsec ((<|>), anyChar, alphaNum, char, digit,
+  endBy, letter, many, many1, noneOf, notFollowedBy, oneOf, parse, ParseError,
+  Parser, sepBy, skipMany1, space, string, try)
 
 -- Parsing
 -- {{{
@@ -53,7 +53,7 @@ parseCharacter = do
   _ <- try (string "#\\")
   value <- try $ string "newline"
              <|> string "space"
-             <|> (anyChar >>= (notFollowedBy alphaNum *>) . pure . pure)
+             <|> ((notFollowedBy alphaNum *>) . pure . pure =<< anyChar)
   pure . Character $ case value of
                           "space"   -> ' '
                           "newline" -> '\n'
@@ -237,9 +237,9 @@ primitives = [ ("&&",             boolBoolBinop (&&))
 
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] ->
   ThrowsError LispVal
-numericBinop _  []     = throwError $ NumArgs 2 []
-numericBinop _  [x]    = throwError $ NumArgs 2 [x]
-numericBinop op ps     = Number . foldl1 op <$> mapM unpackNum ps
+numericBinop _  []  = throwError $ NumArgs 2 []
+numericBinop _  [x] = throwError $ NumArgs 2 [x]
+numericBinop op ps  = Number . foldl1 op <$> mapM unpackNum ps
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] ->
   ThrowsError LispVal
@@ -326,9 +326,8 @@ eqv badArgList = throwError $ NumArgs 2 badArgList
 data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
 
 unpackEquals :: LispVal -> LispVal -> Unpacker -> ThrowsError Bool
-unpackEquals arg1 arg2 (AnyUnpacker unpacker) = do unpacked1 <- unpacker arg1
-                                                   unpacked2 <- unpacker arg2
-                                                   pure $ unpacked1 == unpacked2
+unpackEquals arg1 arg2 (AnyUnpacker unpacker) = liftA2 (==) (unpacker arg1)
+                                                            (unpacker arg2)
                                                  `catchError` const (pure False)
 
 eqvList :: ([LispVal] -> ThrowsError LispVal) -> [LispVal] -> ThrowsError LispVal
