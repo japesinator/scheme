@@ -4,9 +4,11 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TupleSections #-}
 
-module Main where
+module Main (main) where
 
 import Control.Applicative hiding ((<|>), many)
+import Control.Arrow
+import Control.Monad
 import Control.Monad.Error
 import Data.IORef
 import Data.Maybe
@@ -51,7 +53,7 @@ parseCharacter = do
   _ <- try (string "#\\")
   value <- try $ string "newline"
              <|> string "space"
-             <|> (anyChar >>= (notFollowedBy alphaNum *>) . pure . return)
+             <|> (anyChar >>= (notFollowedBy alphaNum *>) . pure . pure)
   pure . Character $ case value of
                           "space"   -> ' '
                           "newline" -> '\n'
@@ -101,7 +103,30 @@ data LispVal = Atom       String
              | String     String
              | Bool       Bool
              | Character  Char
-             deriving (Eq, Show)
+             | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+             | Func [String] (Maybe String) [LispVal] Env
+
+instance Show LispVal where
+  show (Atom a)          = a
+  show (List xs)         = show xs
+  show (DottedList xs x) = show $ xs ++ [x]
+  show (Number n)        = show n
+  show (String s)        = s
+  show (Bool b)          = show b
+  show (Character c)     = [c]
+  show (PrimitiveFunc _) = "<primitive>"
+  show (Func args varargs _ _) = "(lambda (" ++ unwords (map show args) ++
+    (case varargs of Nothing  -> ""; Just arg -> " . " ++ arg) ++ ") ...)"
+
+instance Eq LispVal where
+  (Atom a)          == (Atom b)          = a  == b
+  (List xs)         == (List ys)         = xs == ys
+  (DottedList xs x) == (DottedList ys y) = xs == ys && x == y
+  (Number n)        == (Number m)        = n  == m
+  (String s)        == (String t)        = s  == t
+  (Bool b)          == (Bool c)          = b  == c
+  (Character c)     == (Character d)     = c  == d
+  _                 == _                 = False
 
 --- }}}
 -- Evaluation
@@ -113,14 +138,11 @@ eval _   val@(Number _)                      = pure val
 eval _   val@(Bool _)                        = pure val
 eval env (Atom i)                            = getVar env i
 eval _   (List [Atom "quote", val])          = pure val
+
 eval env (List [Atom "if", pr, conseq, alt]) = eval env pr >>= \case
   Bool True  -> eval env conseq
   Bool False -> eval env alt
   _          -> throwError $ TypeMismatch "bool" pr
-eval env (List [Atom "set!", Atom var, form])   = eval env form >>=
-  setVar env var
-eval env (List [Atom "define", Atom var, form]) = eval env form >>=
-  defineVar env var
 eval env form@(List (Atom "cond" : clauses)) =
   if null clauses
   then throwError $ BadSpecialForm "no true clause in cond expression: " form
@@ -133,15 +155,49 @@ eval env form@(List (Atom "cond" : clauses)) =
                                         , List (Atom "cond" : tail clauses)
                                         ]
             _ -> throwError $ BadSpecialForm "ill-formed cond expression: " form
-eval env (List (Atom func : args)) = mapM (eval env) args >>=
-  liftThrows . apply func
+
+eval env (List [Atom "set!", Atom var, form])   = eval env form >>=
+  setVar env var
+eval env (List [Atom "define", Atom var, form]) = eval env form >>=
+  defineVar env var
+
+eval env (List (Atom "define" : List (Atom var : ps) : b)) =
+  makeFunc Nothing env ps b >>= defineVar env var
+eval env (List (Atom "define" : DottedList (Atom var : ps) varargs : b)) =
+  makeFunc (Just $ show varargs) env ps b >>= defineVar env var
+eval env (List (Atom "lambda" : List ps : b)) = makeFunc Nothing env ps b
+eval env (List (Atom "lambda" : DottedList ps varargs : b)) =
+  makeFunc (Just $ show varargs) env ps b
+eval env (List (Atom "lambda" : varargs@(Atom _) : b)) =
+  makeFunc (Just $ show varargs) env ([] :: [LispVal]) b
+
+eval env (List (function : args))  = join $ liftM2 apply (eval env function)
+                                                         (mapM (eval env) args)
+
 eval _ val@(List _)                = pure val
+
 eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe
-  (throwError $ NotFunction "Unrecognized primitive function args" func)
-  ($ args) $ lookup func primitives
+makeFunc :: Maybe String -> Env -> [LispVal] -> [LispVal]
+         -> IOThrowsError LispVal
+makeFunc varargs env ps = pure . flip (Func (map show ps) varargs) env
+
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func ps varargs b c) args =
+  if length ps /= length args && isNothing varargs
+     then throwError $ NumArgs (toInteger $ length ps) args
+     else fmap last . forM b . eval
+      =<< bind varargs
+      =<< liftIO (bindVars c $ zip ps args)
+       where bind arg env = case arg of
+               Just argName -> liftIO $ bindVars env
+                 [(argName, List $ drop (length ps) args)]
+               Nothing      -> pure env
+apply _ _ = error "We have somehow applied a non-function"
+
+primBindings :: IO Env
+primBindings = nullEnv >>= flip bindVars (map (second PrimitiveFunc) primitives)
 
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [ ("&&",             boolBoolBinop (&&))
@@ -172,7 +228,7 @@ primitives = [ ("&&",             boolBoolBinop (&&))
              , ("symbol2string?", unaryOp       symbol2string)
              , ("string2symbol?", unaryOp       string2symbol)
              , ("car",                          car)
-             , ("cdr",                          car)
+             , ("cdr",                          cdr)
              , ("cons",                         cons)
              , ("eq?",                          eqv)
              , ("eqv?",                         eqv)
@@ -183,7 +239,7 @@ numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] ->
   ThrowsError LispVal
 numericBinop _  []     = throwError $ NumArgs 2 []
 numericBinop _  [x]    = throwError $ NumArgs 2 [x]
-numericBinop op params = Number . foldl1 op <$> mapM unpackNum params
+numericBinop op ps     = Number . foldl1 op <$> mapM unpackNum ps
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] ->
   ThrowsError LispVal
@@ -289,13 +345,13 @@ equal [List arg1, List arg2]             = eqvList equal [List arg1, List arg2]
 equal [DottedList xs x, DottedList ys y] = equal [ List $ xs ++ [x]
                                                  , List $ ys ++ [y]
                                                  ]
-equal [arg1, arg2] = do primitiveEquals <- or <$> mapM (unpackEquals arg1 arg2)
-                                                       [ AnyUnpacker unpackNum
-                                                       , AnyUnpacker unpackStr
-                                                       , AnyUnpacker unpackBool
-                                                       ]
+equal [arg1, arg2] = do primitiveEquals <- mapM (unpackEquals arg1 arg2)
+                                                [ AnyUnpacker unpackNum
+                                                , AnyUnpacker unpackStr
+                                                , AnyUnpacker unpackBool
+                                                ]
                         eqvEquals <- eqv [arg1, arg2]
-                        pure . Bool $ primitiveEquals
+                        pure . Bool $ or primitiveEquals
                                    || (\(Bool x) -> x) eqvEquals
 equal badArgList = throwError $ NumArgs 2 badArgList
 
@@ -330,8 +386,8 @@ instance Error LispError where
 
 type ThrowsError = Either LispError
 
-trapError :: (MonadError e m, Show e) => m String -> m String
-trapError action = catchError action (return . show)
+trapError :: IOThrowsError String -> IOThrowsError String
+trapError = flip catchError $ return . show
 
 readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
@@ -371,11 +427,11 @@ setVar envRef var value = liftIO (readIORef envRef) >>=
 defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
 defineVar envRef var value = do
   alreadyDefined <- liftIO $ isBound envRef var
-  if alreadyDefined then setVar envRef var value >> return value
+  if alreadyDefined then setVar envRef var value *> pure value
                     else liftIO $ do valueRef <- newIORef value
                                      env <- readIORef envRef
                                      writeIORef envRef ((var, valueRef) : env)
-                                     return value
+                                     pure value
 
 bindVars :: Env -> [(String, LispVal)] -> IO Env
 bindVars envRef = (>>= newIORef) . (readIORef envRef >>=)
@@ -398,6 +454,6 @@ runRepl = tilQuit (putStr "Lisp>>> " *> hFlush stdout *> getLine) . evalAndPrint
 
 main :: IO ()
 main = length <$> getArgs >>= \case
-  0 -> nullEnv >>= runRepl
-  1 -> getArgs >>= (nullEnv >>=) . flip evalAndPrint . head
+  0 -> primBindings >>= runRepl
+  1 -> getArgs >>= (primBindings >>=) . flip evalAndPrint . head
   _ -> putStrLn "Program takes only 0 or 1 argument"
