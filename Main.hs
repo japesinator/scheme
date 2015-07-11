@@ -205,6 +205,10 @@ apply (Func ps varargs b c) args =
 apply (IOFunc func) args = func args
 apply _ _ = error "We have somehow applied a non-function"
 
+-- }}}
+-- Standard Library
+-- {{{
+
 primBindings :: IO Env
 primBindings = nullEnv >>= flip bindVars (map (second IOFunc) ioPrimitives
                                        ++ map (second PrimitiveFunc) primitives)
